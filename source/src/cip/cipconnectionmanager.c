@@ -1048,6 +1048,90 @@ EipStatus CheckElectronicKeyData(
     kEipStatusOk : kEipStatusError;
 }
 
+EipUint8 checkPathSize(EipInt16 request_path_size, size_t remaining_path, EipUint16 *extended_error){
+	EipUint8 err = kEipStatusOk;
+	if ((g_kForwardOpenHeaderLength + remaining_path * 2)	//length in bytes
+			< request_path_size ) {
+		/* the received packet is larger than the data in the path */
+		*extended_error = 0;
+		err = kCipErrorTooMuchData;
+	} else if ((g_kForwardOpenHeaderLength + remaining_path * 2)
+			> request_path_size ) {
+		/*there is not enough data in received packet */
+		*extended_error = 0;
+		OPENER_TRACE_INFO("Message not long enough for path\n");
+		err = kCipErrorNotEnoughData;
+	}
+	return err;
+}
+
+EipUint8 ParseElectronicKey(EipUint8 *message, CipConnectionObject *connection_object, size_t *remaining_path, EipUint16 *extended_error){
+	/* first look if there is an electronic key */
+	if ( kSegmentTypeLogicalSegment == GetPathSegmentType(message) ) {	/*Vol1_3.22 Appendix C-1.4*/
+		if ( kLogicalSegmentLogicalTypeSpecial							/*Vol1_3.22 Appendix C-1.4.2*/
+				== GetPathLogicalSegmentLogicalType(message) ) {
+			if ( kLogicalSegmentSpecialTypeLogicalFormatElectronicKey		/*Vol1_3.22 Appendix C-1.4.2 page C-9*/
+					== GetPathLogicalSegmentSpecialTypeLogicalType(message) ) {
+				if ( kElectronicKeySegmentFormatKeyFormat4					/*Vol1_3.22 Appendix C-1.4.2 page C-10*/
+						== GetPathLogicalSegmentElectronicKeyFormat(message) ) {
+					/* Check if there is enough data for holding the electronic key segment */
+					if (*remaining_path < 5) {
+						*extended_error = 0;
+						OPENER_TRACE_INFO("Message not long enough for electronic key\n");
+						return kCipErrorNotEnoughData;
+					}
+					/* Electronic key format 4 found */
+					connection_object->electronic_key.key_format = 4;
+					ElectronicKeyFormat4 *electronic_key = ElectronicKeyFormat4New();
+					GetElectronicKeyFormat4FromMessage(&message, electronic_key);
+					/* logical electronic key found */
+					connection_object->electronic_key.key_data = electronic_key;
+
+
+					*remaining_path -= 5; /*length of the electronic key*/
+					OPENER_TRACE_INFO(
+						"key: ven ID %d, dev type %d, prod code %d, major %d, minor %d\n",
+						ElectronicKeyFormat4GetVendorId(connection_object->electronic_key.key_data),
+						ElectronicKeyFormat4GetDeviceType(connection_object->electronic_key.key_data),
+						ElectronicKeyFormat4GetProductCode(connection_object->electronic_key.key_data),
+						ElectronicKeyFormat4GetMajorRevision(connection_object->electronic_key.key_data),
+						ElectronicKeyFormat4GetMinorRevision(connection_object->electronic_key.key_data) );
+					if ( kEipStatusOk != CheckElectronicKeyData(
+								connection_object->electronic_key.key_format,
+								connection_object->electronic_key.key_data,
+								extended_error) ) {
+						ElectronicKeyFormat4Delete(&electronic_key);
+						return kCipErrorConnectionFailure;
+					}
+					ElectronicKeyFormat4Delete(&electronic_key);
+				}
+
+			} else {
+				OPENER_TRACE_INFO("no key\n");
+			}
+		}
+	}
+	return kEipStatusOk;
+}
+
+ParseProductionInhibitTime(EipUint8 *message, CipConnectionObject *connection_object, size_t *remaining_path){
+//TODO: Refactor this afterwards
+    if ( kConnectionObjectTransportClassTriggerProductionTriggerCyclic		/*Vol1_3.22 3-4.4.3 page 3-14*/
+         != ConnectionObjectGetTransportClassTriggerProductionTrigger(
+           connection_object) ) {
+      /*non cyclic connections may have a production inhibit */
+      if ( kSegmentTypeNetworkSegment == GetPathSegmentType(message) ) {	/*Vol1_3.22 Appendix C-1.4.3 page C-12*/
+        if (kNetworkSegmentSubtypeProductionInhibitTimeInMilliseconds
+            == GetPathNetworkSegmentSubtype(message)) {
+          OPENER_TRACE_INFO("PIT segment available - value: %u\n",message[1]);
+          connection_object->production_inhibit_time = message[1];
+          message += 2;
+          *remaining_path -= 1;
+        }
+      }
+    }
+}
+
 EipUint8 ParseConnectionPath(
   CipConnectionObject *connection_object,
   CipMessageRouterRequest *message_router_request,
@@ -1056,6 +1140,8 @@ EipUint8 ParseConnectionPath(
   const EipUint8 *message = message_router_request->data;
   const size_t connection_path_size = GetSintFromMessage(&message); /* length in words */
   size_t remaining_path = connection_path_size;
+  EipUint8 error = kEipStatusOk;
+
   CipClass *class = NULL;
 
   CipDword class_id = 0x0;
@@ -1064,91 +1150,15 @@ EipUint8 ParseConnectionPath(
   /* with 256 we mark that we haven't got a PIT segment */
   ConnectionObjectSetProductionInhibitTime(connection_object, 256);
 
-  if ( (g_kForwardOpenHeaderLength + remaining_path * 2)
-       < message_router_request->request_path_size ) {
-    /* the received packet is larger than the data in the path */
-    *extended_error = 0;
-    return kCipErrorTooMuchData;
-  }
-
-  if ( (g_kForwardOpenHeaderLength + remaining_path * 2)
-       > message_router_request->request_path_size ) {
-    /*there is not enough data in received packet */
-    *extended_error = 0;
-    OPENER_TRACE_INFO("Message not long enough for path\n");
-    return kCipErrorNotEnoughData;
-  }
+  if((error = checkPathSize(message_router_request->request_path_size, remaining_path, extended_error)) != kEipStatusOk)
+  	  return error;
 
   if (remaining_path > 0) {
-    /* first look if there is an electronic key */
-    if ( kSegmentTypeLogicalSegment == GetPathSegmentType(message) ) {
-      if ( kLogicalSegmentLogicalTypeSpecial
-           == GetPathLogicalSegmentLogicalType(message) ) {
-        if ( kLogicalSegmentSpecialTypeLogicalFormatElectronicKey
-             == GetPathLogicalSegmentSpecialTypeLogicalType(message) ) {
-          if ( kElectronicKeySegmentFormatKeyFormat4
-               == GetPathLogicalSegmentElectronicKeyFormat(message) ) {
-            /* Check if there is enough data for holding the electronic key segment */
-            if (remaining_path < 5) {
-              *extended_error = 0;
-              OPENER_TRACE_INFO("Message not long enough for electronic key\n");
-              return kCipErrorNotEnoughData;
-            }
-            /* Electronic key format 4 found */
-            connection_object->electronic_key.key_format = 4;
-            ElectronicKeyFormat4 *electronic_key = ElectronicKeyFormat4New();
-            GetElectronicKeyFormat4FromMessage(&message, electronic_key);
-            /* logical electronic key found */
-            connection_object->electronic_key.key_data = electronic_key;
+	  error = ParseElectronicKey(message, connection_object, &remaining_path, extended_error);
 
+	  ParseProductionInhibitTime(message, connection_object, &remaining_path);
 
-            remaining_path -= 5; /*length of the electronic key*/
-            OPENER_TRACE_INFO(
-              "key: ven ID %d, dev type %d, prod code %d, major %d, minor %d\n",
-              ElectronicKeyFormat4GetVendorId(connection_object->electronic_key.
-                                              key_data),
-              ElectronicKeyFormat4GetDeviceType(connection_object->
-                                                electronic_key.key_data),
-              ElectronicKeyFormat4GetProductCode(connection_object->
-                                                 electronic_key.key_data),
-              ElectronicKeyFormat4GetMajorRevision(connection_object->
-                                                   electronic_key.key_data),
-              ElectronicKeyFormat4GetMinorRevision(connection_object->
-                                                   electronic_key.key_data) );
-            if ( kEipStatusOk
-                 != CheckElectronicKeyData(
-                   connection_object->electronic_key.key_format,
-                   connection_object->electronic_key.key_data,
-                   extended_error) ) {
-              ElectronicKeyFormat4Delete(&electronic_key);
-              return kCipErrorConnectionFailure;
-            }
-            ElectronicKeyFormat4Delete(&electronic_key);
-          }
-
-        } else {
-          OPENER_TRACE_INFO("no key\n");
-        }
-      }
-    }
-
-    //TODO: Refactor this afterwards
-    if ( kConnectionObjectTransportClassTriggerProductionTriggerCyclic
-         != ConnectionObjectGetTransportClassTriggerProductionTrigger(
-           connection_object) ) {
-      /*non cyclic connections may have a production inhibit */
-      if ( kSegmentTypeNetworkSegment == GetPathSegmentType(message) ) {
-        NetworkSegmentSubtype network_segment_subtype =
-          GetPathNetworkSegmentSubtype(message);
-        if (kNetworkSegmentSubtypeProductionInhibitTimeInMilliseconds
-            == network_segment_subtype) {
-          OPENER_TRACE_INFO("PIT segment available - value: %u\n",message[1]);
-          connection_object->production_inhibit_time = message[1];
-          message += 2;
-          remaining_path -= 1;
-        }
-      }
-    }
+	  error = ParseClassId(message, connection_object, &remaining_path, extended_error);
 
     if (kSegmentTypeLogicalSegment == GetPathSegmentType(message) &&
         kLogicalSegmentLogicalTypeClassId ==
